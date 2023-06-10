@@ -1,104 +1,146 @@
 import { randomUUID } from 'crypto';
 import * as vscode from 'vscode';
 
+import { TwitchAuthService } from './twitchAuthService';
+
 export const AUTH_TYPE = 'twitch';
 const AUTH_NAME = 'Twitch';
 const SESSIONS_SECRET_KEY = `${AUTH_TYPE}.sessions`;
 
-export class TwitchAuthenticationProvider implements vscode.AuthenticationProvider, vscode.Disposable {
-  private _sessionChangeEmitter = new vscode.EventEmitter<vscode.AuthenticationProviderAuthenticationSessionsChangeEvent>();
-  private _disposable: vscode.Disposable;
+export interface TwitchCredential {
+  username: string;
+  accessToken: string;
+  scopes: string[];
+}
 
-  constructor(private readonly context: vscode.ExtensionContext) {
-    this._disposable = vscode.Disposable.from(
-      vscode.authentication.registerAuthenticationProvider(AUTH_TYPE, AUTH_NAME, this, { supportsMultipleAccounts: false })
-    );
+class TwitchAuthenticationSession implements vscode.AuthenticationSession {
+  readonly accessToken: string;
+  readonly account: vscode.AuthenticationProviderInformation;
+  readonly id: string = randomUUID();
+  readonly scopes: string[] = [];
+  constructor(username: string, password: string, scopes: readonly string[]) {
+    this.scopes.push(...scopes);
+    this.accessToken = password;
+    this.account = {
+      id: username,
+      label: `${username}`
+    };
   }
+}
 
-  get onDidChangeSessions() {
-    return this._sessionChangeEmitter.event;
-  }
+export class TwitchAuthenticationProvider implements vscode.AuthenticationProvider {
+  public static id: string = "TwitchAuthProvider";
+  private _sessions: TwitchAuthenticationSession[] = [];
+  private readonly _onDidChangeSessions = new vscode.EventEmitter<vscode.AuthenticationProviderAuthenticationSessionsChangeEvent>();
+  onDidChangeSessions: vscode.Event<vscode.AuthenticationProviderAuthenticationSessionsChangeEvent> = this._onDidChangeSessions.event;
 
-  /**
-   * Get the existing sessions
-   * @param scopes 
-   * @returns 
-   */
-   public async getSessions(scopes?: string[]): Promise<readonly vscode.AuthenticationSession[]> {
-    return [];
-  }
+  constructor(private readonly secrets: vscode.SecretStorage) {
+    this.init();
+    this.onDidChangeSessions((evt) => {
+      if (evt.added && evt.added.length > 0) {
 
-  /**
-   * Create a new auth session
-   * @param scopes 
-   * @returns 
-   */
-  public async createSession(scopes: string[]): Promise<vscode.AuthenticationSession> {
-    try {
-      const token = await this.login(scopes);
-      if (!token) {
-        throw new Error(`Twitch login failure`);
       }
+      if (evt.removed && evt.removed.length > 0) {
 
-      const userinfo: { name: string, email: string } = await this.getUserInfo(token);
-
-      const session: vscode.AuthenticationSession = {
-        id: randomUUID(),
-        accessToken: token,
-        account: {
-          label: userinfo.name,
-          id: userinfo.email
-        },
-        scopes: []
-      };
-
-      await this.context.secrets.store(SESSIONS_SECRET_KEY, JSON.stringify([session]));
-
-      this._sessionChangeEmitter.fire({ added: [session], removed: [], changed: [] });
-
-      return session;
-    } catch (e) {
-      vscode.window.showErrorMessage(`Sign in failed: ${e}`);
-      throw e;
-    }
-  }
-
-  /**
-   * Remove an existing session
-   * @param sessionId 
-   */
-  public async removeSession(sessionId: string): Promise<void> {
-    
-  }
-
-  /**
-   * Dispose the registered services
-   */
-  public async dispose() {
-    this._disposable.dispose();
-  }
-
-  private login(scopes: string[] = []) {
-    return vscode.window.withProgress<string>({
-      location: vscode.ProgressLocation.Notification,
-      title: "Signing in to Twitch...",
-      cancellable: true
-    }, async (_, token) => {
-      const stateId = randomUUID();      
-      //this._pendingStates.push(stateId);
-
-      const scopeString = scopes.join(' ');
-
-      const uri = vscode.Uri.parse("https://www.google.com");
-      await vscode.env.openExternal(uri);
-
-      try {
-        return await Promise.race([
-          new Promise<string>((_, reject) => setTimeout(() => reject('Cancelled'), 60000)),
-        ]);
-      } finally {
-        //this._pendingStates = this._pendingStates.filter(n => n !== stateId);
       }
     });
+  }
+
+  async getSessions(scopes?: readonly string[] | undefined) : Promise<readonly vscode.AuthenticationSession[]> {
+    const sessions = this._sessions.filter(session => scopes !== undefined ? session.scopes[0] === scopes[0] : true);
+    return sessions;
+  }
+
+  async createSession(scopes: readonly string[]) : Promise<vscode.AuthenticationSession> {
+    // TODO: Sign-in to Twitch API
+    const s = new TwitchAuthenticationSession("", "", scopes);
+    return s;
+  }
+
+  async removeSession(sessionId: string) : Promise<void> {
+    const idx = this._sessions.findIndex(s => s.id === sessionId);
+    const s = this._sessions[idx];
+    await TwitchAuthService.revokeToken(s.accessToken);
+    this._sessions.splice(idx, 1);
+    this._onDidChangeSessions.fire({ added: [], removed: [s], changed: []});
+    await this.saveSecrets();
+  }
+
+  async init() {
+    const credentials = await this.getCredentials();
+    const added: TwitchAuthenticationSession[] = [];
+
+    if (credentials) {
+      credentials?.map(credential => {
+        const session = new TwitchAuthenticationSession(credential.username, credential.accessToken, credential.scopes);
+        added.push(session);
+      });
+      this._sessions.push(...added);
+      this._onDidChangeSessions.fire({ added, removed: [], changed: [] });
+    }
+
+    this.secrets.onDidChange(e => {
+      if (e.key === TwitchAuthenticationProvider.id) {
+
+        // Get the credentials from the saved store
+        this.getCredentials().then(credentials => {
+          const added: TwitchAuthenticationSession[] = [];
+          const removed: TwitchAuthenticationSession[] = [];
+          const changed: TwitchAuthenticationSession[] = [];
+          const sessions = credentials?.map(credential => new TwitchAuthenticationSession(credential.username, credential.accessToken, credential.scopes));
+
+          // Address invalidated sessions
+          this._sessions.forEach(previousSession => {
+            const session = sessions?.find(session => session.account.id === previousSession.account.id);
+            if (session && session.accessToken !== previousSession.accessToken) {
+              changed.push(previousSession);
+            }
+          });
+
+          // Address removed sessions
+          const sessionToRemove = this._sessions.filter(session => !sessions?.some(s => s.account.id === session.account.id));
+          sessionToRemove.forEach(session => {
+            const idx = this._sessions.findIndex(s => s.id === session.id);
+            removed.push(...this._sessions.splice(idx, 1));
+          });
+
+          // Add new sessions
+          const sessionsToAdd = sessions?.filter(session => !this._sessions.some(s => s.account.id === session.account.id));
+          if (sessionsToAdd) {
+            this._sessions.push(...sessionsToAdd);
+            added.push(...sessionsToAdd);
+          }
+
+          this._onDidChangeSessions.fire({ added, removed, changed });
+        });
+
+      }
+    });
+  }
+
+  async getCredentials(): Promise<TwitchCredential[] | undefined> {
+    const credentialJSON = await this.secrets.get(TwitchAuthenticationProvider.id);
+    if (credentialJSON) {
+      const credentials = JSON.parse(credentialJSON) as TwitchCredential[];
+      return credentials;
+    }
+    return undefined;
+  }
+
+  async saveSecrets() {
+    const credentials: TwitchCredential[] = [];
+    this._sessions.forEach(session => {
+      credentials.push({
+        username: session.account.id,
+        accessToken: session.accessToken,
+        scopes: session.scopes
+      });
+    });
+    if (credentials.length > 0) {
+      const credentialJSON = JSON.stringify(credentials);
+      await this.secrets.store(TwitchAuthenticationProvider.id, credentialJSON);
+    } else {
+      await this.secrets.delete(TwitchAuthenticationProvider.id);
+    }
   }
 }
